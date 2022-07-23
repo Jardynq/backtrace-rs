@@ -90,34 +90,6 @@ struct MyContext(CONTEXT);
 
 //#[inline(always)]
 pub unsafe fn trace(cb: &mut dyn FnMut(&super::Frame) -> bool, thread: *mut c_void) {
-    // Allocate necessary structures for doing the stack walk
-    let process = GetCurrentProcess();
-
-    let mut context = mem::zeroed::<MyContext>();
-    if thread == GetCurrentThread() || thread.is_null() {
-        RtlCaptureContext(&mut context.0);
-    } else {
-        // The suspending and resuming of threads is very risky.
-        // It can end in a deadlock if the current thread tries to access
-        // an object thats been locked by the suspended thread.
-        // That's why we only do as little work as possible while
-        // the thread is suspended, and resume it quickly after.
-
-        // There is most definitely more pitfalls i haven't thought
-        // of or encountered. This is windows after all.
-
-        context.0.ContextFlags = CONTEXT_ALL; // TODO: Narrow down required flags
-        if SuspendThread(thread) as i32 == -1 {
-            ResumeThread(thread);
-            return;
-        }
-        let status = GetThreadContext(thread, &mut context.0);
-        if ResumeThread(thread) as i32 == -1 || status == 0{
-            return;
-        }
-    }
-
-
     // Ensure this process's symbols are initialized
     let dbghelp = match dbghelp::init() {
         Ok(dbghelp) => dbghelp,
@@ -166,6 +138,12 @@ pub unsafe fn trace(cb: &mut dyn FnMut(&super::Frame) -> bool, thread: *mut c_vo
                     base_address: 0 as _,
                 },
             };
+
+            let (mut context, do_resume) = match suspend_thread_and_capture_context(thread) {
+                Some((context, do_resume)) => (context, do_resume),
+                None => return,
+            };
+
             let image = init_frame(&mut frame.inner, &context.0);
             let frame_ptr = match &mut frame.inner.stack_frame {
                 StackFrame::New(ptr) => ptr as *mut STACKFRAME_EX,
@@ -174,7 +152,7 @@ pub unsafe fn trace(cb: &mut dyn FnMut(&super::Frame) -> bool, thread: *mut c_vo
 
             while StackWalkEx(
                 image as DWORD,
-                process,
+                process_handle,
                 thread,
                 frame_ptr,
                 &mut context.0 as *mut CONTEXT as *mut _,
@@ -191,6 +169,9 @@ pub unsafe fn trace(cb: &mut dyn FnMut(&super::Frame) -> bool, thread: *mut c_vo
                     break;
                 }
             }
+            if do_resume {
+                ResumeThread(thread);
+            }
         }
         None => {
             let mut frame = super::Frame {
@@ -199,6 +180,12 @@ pub unsafe fn trace(cb: &mut dyn FnMut(&super::Frame) -> bool, thread: *mut c_vo
                     base_address: 0 as _,
                 },
             };
+
+            let (mut context, do_resume) = match suspend_thread_and_capture_context(thread) {
+                Some((context, do_resume)) => (context, do_resume),
+                None => return,
+            };
+
             let image = init_frame(&mut frame.inner, &context.0);
             let frame_ptr = match &mut frame.inner.stack_frame {
                 StackFrame::Old(ptr) => ptr as *mut STACKFRAME64,
@@ -207,7 +194,7 @@ pub unsafe fn trace(cb: &mut dyn FnMut(&super::Frame) -> bool, thread: *mut c_vo
 
             while dbghelp.StackWalk64()(
                 image as DWORD,
-                process,
+                process_handle,
                 thread,
                 frame_ptr,
                 &mut context.0 as *mut CONTEXT as *mut _,
@@ -223,7 +210,46 @@ pub unsafe fn trace(cb: &mut dyn FnMut(&super::Frame) -> bool, thread: *mut c_vo
                     break;
                 }
             }
+            if do_resume {
+                ResumeThread(thread);
+            }
         }
+    }
+}
+
+unsafe fn suspend_thread_and_capture_context(thread: *mut c_void) -> Option<(MyContext, bool)> {
+    let mut context = mem::zeroed::<MyContext>();
+    if thread == GetCurrentThread() || thread.is_null() {
+        // Capture current thread, no synchronization needed.
+        RtlCaptureContext(&mut context.0);
+        Some((context, false))
+    } else {
+        // Capture non calling thread.
+        // Thread must be suspended while capturing backtrace.
+
+        // The suspending and resuming of threads is very risky.
+        // It can end in a deadlock if the current thread tries to access
+        // an object thats been locked by the suspended thread.
+        // That's why we only do as little work as possible while
+        // the thread is suspended, and resume it quickly after.
+
+        // There is most definitely more pitfalls i haven't thought
+        // of or encountered. This is windows after all.
+
+        context.0.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        if SuspendThread(thread) as i32 == -1 {
+            // TODO: I am unsure about when SuspendThread fails. Will it still increase suspend count?
+            //ResumeThread(thread);
+            return None;
+        }
+        let status = GetThreadContext(thread, &mut context.0);
+        if status == 0 {
+            ResumeThread(thread);
+            return None;
+        }
+
+        // The thread must be resumed by the caller.
+        Some((context, true))
     }
 }
 
