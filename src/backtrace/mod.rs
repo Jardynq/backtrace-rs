@@ -63,11 +63,18 @@ pub fn trace<F: FnMut(&Frame) -> bool>(cb: F) {
 ///
 /// See information on `trace` for caveats on `cb` panicking.
 pub unsafe fn trace_unsynchronized<F: FnMut(&Frame) -> bool>(mut cb: F) {
-    trace_imp(&mut cb, 0 as _)
+    #[cfg(not(target_os = "windows"))]
+    trace_imp(&mut cb);
+    #[cfg(target_os = "windows")]
+    trace_imp(&mut cb, 0 as _);
 }
 
 /// TODO docs
-pub unsafe fn trace_thread_unsynchronized<F: FnMut(&Frame) -> bool>(thread: *mut c_void, mut cb: F) {
+#[cfg(target_os = "windows")]
+pub unsafe fn trace_thread_unsynchronized<F: FnMut(&Frame) -> bool>(
+    thread: *mut c_void,
+    mut cb: F,
+) {
     trace_imp(&mut cb, thread)
 }
 
